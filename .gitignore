@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# VS Code local settings
+.vscode/
+
+# Dataset and generated data files
+data/raw/*
+data/processed/*
+data/splits/*
+
+# Keep folder structure if .gitkeep files are present
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/splits/.gitkeep
+
+# Model checkpoints and training outputs
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+logs/
+results/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
