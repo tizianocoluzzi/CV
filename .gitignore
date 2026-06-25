@@ -30,3 +30,6 @@ env/
 
 # Jupyter temporary files
 .ipynb_checkpoints/
+
+# Python version 
+.python-version
