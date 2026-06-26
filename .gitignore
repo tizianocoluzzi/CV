@@ -33,3 +33,5 @@ env/
 
 # Python version 
 .python-version
+
+PROJECT_CONTEXT.md
