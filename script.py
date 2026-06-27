@@ -83,17 +83,17 @@ MODEL_CONFIGS = {
 # Set FAST_DEV_RUN = False for the real project run.
 FAST_DEV_RUN = False
 
-SAMPLES_PER_GROUP = 300
+SAMPLES_PER_GROUP = 500
 NUM_EPOCHS = 15
 PATIENCE = 4
-BATCH_SIZE = 16
+BATCH_SIZE = 128
 
 FAST_SAMPLES_PER_GROUP = 5
 FAST_NUM_EPOCHS = 1
 FAST_PATIENCE = 1
 FAST_BATCH_SIZE = 2
 
-NUM_WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2))
+NUM_WORKERS = 0 #min(4, max(1, (os.cpu_count() or 2) // 2))
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_DELTA = 1e-4
@@ -104,6 +104,9 @@ MIN_DELTA = 1e-4
 LAMBDA = 0.5
 
 FREEZE_BACKBONE = True
+# Number of final Swin encoder stages to train when FREEZE_BACKBONE is True.
+# 0 keeps the previous behavior: the full backbone stays frozen.
+SWIN_TRAINABLE_STAGES = 1
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -420,11 +423,17 @@ def make_loaders(train_df, val_df, test_df, image_processor, batch_size: int):
 # == NETWORK ==
 
 class TransformerFeatureExtractor(nn.Module):
-    def __init__(self, cfg: dict, freeze_backbone: bool = FREEZE_BACKBONE):
+    def __init__(
+        self,
+        cfg: dict,
+        freeze_backbone: bool = FREEZE_BACKBONE,
+        swin_trainable_stages: int = SWIN_TRAINABLE_STAGES,
+    ):
         super().__init__()
         self.cfg = cfg
         self.backbone_type = cfg["type"]
         self.freeze_backbone = freeze_backbone
+        self.swin_trainable_stages = swin_trainable_stages
         hf_name = cfg["name"]
 
         config = AutoConfig.from_pretrained(hf_name)
@@ -446,9 +455,15 @@ class TransformerFeatureExtractor(nn.Module):
             if self.visual_projection is not None:
                 for parameter in self.visual_projection.parameters():
                     parameter.requires_grad = False
+            self._unfreeze_swin_stages(swin_trainable_stages)
+            self.backbone_fully_frozen = not any(
+                parameter.requires_grad for parameter in self.backbone.parameters()
+            )
             self.backbone.eval()
             if self.visual_projection is not None:
                 self.visual_projection.eval()
+        else:
+            self.backbone_fully_frozen = False
 
     @staticmethod
     def _infer_embed_dim(backbone: nn.Module) -> int:
@@ -457,6 +472,44 @@ class TransformerFeatureExtractor(nn.Module):
             if hasattr(cfg, attr):
                 return int(getattr(cfg, attr))
         raise ValueError("Could not infer backbone embedding dimension from config.")
+
+    def _unfreeze_swin_stages(self, swin_trainable_stages: int) -> None:
+        if swin_trainable_stages <= 0:
+            return
+        if getattr(self.backbone.config, "model_type", None) != "swin":
+            return
+
+        stages = getattr(getattr(self.backbone, "encoder", None), "layers", None)
+        if stages is None:
+            raise ValueError("Could not find Swin encoder stages to unfreeze.")
+        if swin_trainable_stages > len(stages):
+            raise ValueError(
+                f"SWIN_TRAINABLE_STAGES={swin_trainable_stages} exceeds "
+                f"available Swin stages ({len(stages)})."
+            )
+
+        for stage in stages[-swin_trainable_stages:]:
+            for parameter in stage.parameters():
+                parameter.requires_grad = True
+        for module_name in ("layernorm", "pooler"):
+            module = getattr(self.backbone, module_name, None)
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad = True
+
+    def _set_swin_trainable_stages_mode(self, mode: bool) -> None:
+        if self.swin_trainable_stages <= 0:
+            return
+        if getattr(self.backbone.config, "model_type", None) != "swin":
+            return
+
+        stages = getattr(getattr(self.backbone, "encoder", None), "layers", None)
+        for stage in stages[-self.swin_trainable_stages:]:
+            stage.train(mode)
+        for module_name in ("layernorm", "pooler"):
+            module = getattr(self.backbone, module_name, None)
+            if module is not None:
+                module.train(mode)
 
     @staticmethod
     def _pool_generic_output(outputs) -> torch.Tensor:
@@ -476,7 +529,7 @@ class TransformerFeatureExtractor(nn.Module):
         return flattened.mean(dim=1)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        if self.freeze_backbone:
+        if self.freeze_backbone and self.backbone_fully_frozen:
             with torch.no_grad():
                 return self._forward_backbone(pixel_values)
         return self._forward_backbone(pixel_values)
@@ -496,6 +549,8 @@ class TransformerFeatureExtractor(nn.Module):
             self.backbone.eval()
             if self.visual_projection is not None:
                 self.visual_projection.eval()
+            if not self.backbone_fully_frozen:
+                self._set_swin_trainable_stages_mode(mode)
         return self
 
 
@@ -672,7 +727,11 @@ def train_single_task_model(
     model = SingleTaskTransformerClassifier(cfg, num_classes=num_classes, task=task).to(DEVICE)
     total_params, trainable_params = count_parameters(model)
     print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,} (freeze_backbone={FREEZE_BACKBONE})")
+    print(
+        f"Trainable parameters: {trainable_params:,} "
+        f"(freeze_backbone={FREEZE_BACKBONE}, "
+        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES})"
+    )
     verify_single_task_forward(model, train_loader, task, num_classes)
 
     criterion = nn.CrossEntropyLoss()
@@ -739,7 +798,11 @@ def train_multitask_model(
     model = MultiTaskTransformerClassifier(cfg).to(DEVICE)
     total_params, trainable_params = count_parameters(model)
     print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,} (freeze_backbone={FREEZE_BACKBONE})")
+    print(
+        f"Trainable parameters: {trainable_params:,} "
+        f"(freeze_backbone={FREEZE_BACKBONE}, "
+        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES})"
+    )
     verify_multitask_forward(model, train_loader)
 
     criterion_binary = nn.CrossEntropyLoss()
@@ -1065,6 +1128,7 @@ def build_comparison_table(
             "selected_backbone": SELECTED_BACKBONE,
             "task_type": "binary",
             "freeze_backbone": FREEZE_BACKBONE,
+            "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
             "lambda": np.nan,
             "binary_loss_weight": 1.0,
             "transform_loss_weight": np.nan,
@@ -1085,6 +1149,7 @@ def build_comparison_table(
             "selected_backbone": SELECTED_BACKBONE,
             "task_type": "transform",
             "freeze_backbone": FREEZE_BACKBONE,
+            "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
             "lambda": np.nan,
             "binary_loss_weight": np.nan,
             "transform_loss_weight": 1.0,
@@ -1105,6 +1170,7 @@ def build_comparison_table(
             "selected_backbone": SELECTED_BACKBONE,
             "task_type": "multitask",
             "freeze_backbone": FREEZE_BACKBONE,
+            "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
             "lambda": LAMBDA,
             "binary_loss_weight": LAMBDA,
             "transform_loss_weight": 1.0 - LAMBDA,
@@ -1145,6 +1211,8 @@ def main() -> None:
         f"patience={settings.patience}, "
         f"batch_size={settings.batch_size}, "
         f"num_workers={NUM_WORKERS}, "
+        f"freeze_backbone={FREEZE_BACKBONE}, "
+        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES}, "
         f"lambda={LAMBDA}, "
         f"binary_loss_weight={LAMBDA}, "
         f"transform_loss_weight={1.0 - LAMBDA}"
