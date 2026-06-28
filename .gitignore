@@ -27,6 +27,7 @@ runs/
 logs/
 results/
 env/
+.cache/
 
 # Jupyter temporary files
 .ipynb_checkpoints/
