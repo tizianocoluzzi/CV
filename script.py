@@ -83,24 +83,25 @@ MODEL_CONFIGS = {
 # Set FAST_DEV_RUN = False for the real project run.
 FAST_DEV_RUN = False
 
-SAMPLES_PER_GROUP = 750
+SAMPLES_PER_GROUP = 1000
 NUM_EPOCHS = 15
 PATIENCE = 4
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 
 FAST_SAMPLES_PER_GROUP = 5
 FAST_NUM_EPOCHS = 1
 FAST_PATIENCE = 1
-FAST_BATCH_SIZE = 2
+FAST_BATCH_SIZE = 4
 
-NUM_WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2))
+NUM_WORKERS = min(2, max(1, (os.cpu_count() or 2) // 2))
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 MIN_DELTA = 1e-4
 
 # Multi-task loss:
 #     total_loss = LAMBDA * binary_loss + (1 - LAMBDA) * transform_loss
-# LAMBDA = 0.5 gives equal weight to the two tasks.
+# The script evaluates a small sweep of lambda values to compare task weighting.
+LAMBDA_VALUES = [0.2, 0.35, 0.65, 0.8]
 LAMBDA = 0.5
 
 FREEZE_BACKBONE = True
@@ -590,6 +591,7 @@ def run_multitask_epoch(
     loader: DataLoader,
     criterion_binary: nn.Module,
     criterion_transform: nn.Module,
+    lambda_value: float,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> tuple[float, float, float, float]:
     is_training = optimizer is not None
@@ -609,7 +611,7 @@ def run_multitask_epoch(
             binary_logits, transform_logits = model(pixel_values)
             loss_binary = criterion_binary(binary_logits, binary_labels)
             loss_transform = criterion_transform(transform_logits, transform_labels)
-            loss_total = LAMBDA * loss_binary + (1.0 - LAMBDA) * loss_transform
+            loss_total = lambda_value * loss_binary + (1.0 - lambda_value) * loss_transform
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -728,12 +730,13 @@ def train_multitask_model(
     train_loader: DataLoader,
     val_loader: DataLoader,
     settings: RunSettings,
+    lambda_value: float,
 ) -> tuple[TrainResult, nn.Module]:
-    model_name = "multitask"
+    model_name = f"multitask_lambda_{lambda_value:.2f}"
     checkpoint_path = CHECKPOINT_DIR / f"{SELECTED_BACKBONE}_{model_name}.pt"
 
     print("\n" + "=" * 72)
-    print(f"Training {model_name} | backbone={SELECTED_BACKBONE}")
+    print(f"Training {model_name} | backbone={SELECTED_BACKBONE} | lambda={lambda_value:.2f}")
     print("=" * 72)
 
     model = MultiTaskTransformerClassifier(cfg).to(DEVICE)
@@ -761,6 +764,7 @@ def train_multitask_model(
             train_loader,
             criterion_binary,
             criterion_transform,
+            lambda_value,
             optimizer,
         )
         val_loss, val_binary_acc, val_transform_acc, val_joint = run_multitask_epoch(
@@ -768,6 +772,7 @@ def train_multitask_model(
             val_loader,
             criterion_binary,
             criterion_transform,
+            lambda_value,
         )
         epochs_ran = epoch
 
@@ -1033,19 +1038,23 @@ def evaluate_single_task_model(
     )
 
 
-def evaluate_multitask_model(model: nn.Module, loader: DataLoader) -> tuple[dict[str, float], dict[str, float]]:
+def evaluate_multitask_model(
+    model: nn.Module,
+    loader: DataLoader,
+    run_name: str,
+) -> tuple[dict[str, float], dict[str, float]]:
     predictions = collect_multitask_predictions(model, loader)
     binary_metrics = evaluate_binary_outputs(
         predictions["binary_true"],
         predictions["binary_pred"],
         predictions["binary_prob"],
         predictions["transform_true"],
-        "multitask_binary",
+        f"{run_name}_binary",
     )
     transform_metrics = evaluate_transform_outputs(
         predictions["transform_true"],
         predictions["transform_pred"],
-        "multitask_transform",
+        f"{run_name}_transform",
     )
     return binary_metrics, transform_metrics
 
@@ -1055,9 +1064,7 @@ def build_comparison_table(
     binary_metrics: dict[str, float],
     transform_train: TrainResult,
     transform_metrics: dict[str, float],
-    multitask_train: TrainResult,
-    multitask_binary_metrics: dict[str, float],
-    multitask_transform_metrics: dict[str, float],
+    multitask_results: list[dict[str, object]],
 ) -> pd.DataFrame:
     rows = [
         {
@@ -1100,27 +1107,8 @@ def build_comparison_table(
             "transform_test_macro_f1": transform_metrics.get("transform_test_macro_f1", np.nan),
             "checkpoint_path": str(transform_train.checkpoint_path),
         },
-        {
-            "model_name": "multitask",
-            "selected_backbone": SELECTED_BACKBONE,
-            "task_type": "multitask",
-            "freeze_backbone": FREEZE_BACKBONE,
-            "lambda": LAMBDA,
-            "binary_loss_weight": LAMBDA,
-            "transform_loss_weight": 1.0 - LAMBDA,
-            "best_val_score": multitask_train.best_val_score,
-            "epochs_ran": multitask_train.epochs_ran,
-            "binary_test_accuracy": multitask_binary_metrics.get("binary_test_accuracy", np.nan),
-            "binary_test_macro_f1": multitask_binary_metrics.get("binary_test_macro_f1", np.nan),
-            "binary_test_roc_auc": multitask_binary_metrics.get("binary_test_roc_auc", np.nan),
-            "binary_acc_original": multitask_binary_metrics.get("binary_acc_original", np.nan),
-            "binary_acc_redigital": multitask_binary_metrics.get("binary_acc_redigital", np.nan),
-            "binary_acc_transfer": multitask_binary_metrics.get("binary_acc_transfer", np.nan),
-            "transform_test_accuracy": multitask_transform_metrics.get("transform_test_accuracy", np.nan),
-            "transform_test_macro_f1": multitask_transform_metrics.get("transform_test_macro_f1", np.nan),
-            "checkpoint_path": str(multitask_train.checkpoint_path),
-        },
     ]
+    rows.extend(multitask_results)
     return pd.DataFrame(rows)
 
 
@@ -1128,12 +1116,15 @@ def build_comparison_table(
 
 def main() -> None:
     set_seed(SEED)
-    validate_lambda(LAMBDA)
     settings = get_run_settings()
     cfg = get_selected_model_config()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+    lambda_values = [LAMBDA] if FAST_DEV_RUN else LAMBDA_VALUES
+    for lambda_value in lambda_values:
+        validate_lambda(lambda_value)
 
     print(f"Device: {DEVICE}")
     print(f"FAST_DEV_RUN: {FAST_DEV_RUN}")
@@ -1145,9 +1136,7 @@ def main() -> None:
         f"patience={settings.patience}, "
         f"batch_size={settings.batch_size}, "
         f"num_workers={NUM_WORKERS}, "
-        f"lambda={LAMBDA}, "
-        f"binary_loss_weight={LAMBDA}, "
-        f"transform_loss_weight={1.0 - LAMBDA}"
+        f"lambda_values={', '.join(f'{value:.2f}' for value in lambda_values)}"
     )
 
     full_index = build_image_index(DATA_ROOT)
@@ -1200,24 +1189,52 @@ def main() -> None:
     del transform_model
     clear_memory()
 
-    multitask_train, multitask_model = train_multitask_model(
-        cfg=cfg,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        settings=settings,
-    )
-    multitask_binary_metrics, multitask_transform_metrics = evaluate_multitask_model(multitask_model, test_loader)
-    del multitask_model
-    clear_memory()
+    multitask_rows = []
+    for lambda_value in lambda_values:
+        multitask_train, multitask_model = train_multitask_model(
+            cfg=cfg,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            settings=settings,
+            lambda_value=lambda_value,
+        )
+        run_name = f"multitask_lambda_{lambda_value:.2f}"
+        multitask_binary_metrics, multitask_transform_metrics = evaluate_multitask_model(
+            multitask_model,
+            test_loader,
+            run_name,
+        )
+        del multitask_model
+        clear_memory()
+        multitask_rows.append(
+            {
+                "model_name": f"multitask_lambda_{lambda_value:.2f}",
+                "selected_backbone": SELECTED_BACKBONE,
+                "task_type": "multitask",
+                "freeze_backbone": FREEZE_BACKBONE,
+                "lambda": lambda_value,
+                "binary_loss_weight": lambda_value,
+                "transform_loss_weight": 1.0 - lambda_value,
+                "best_val_score": multitask_train.best_val_score,
+                "epochs_ran": multitask_train.epochs_ran,
+                "binary_test_accuracy": multitask_binary_metrics.get("binary_test_accuracy", np.nan),
+                "binary_test_macro_f1": multitask_binary_metrics.get("binary_test_macro_f1", np.nan),
+                "binary_test_roc_auc": multitask_binary_metrics.get("binary_test_roc_auc", np.nan),
+                "binary_acc_original": multitask_binary_metrics.get("binary_acc_original", np.nan),
+                "binary_acc_redigital": multitask_binary_metrics.get("binary_acc_redigital", np.nan),
+                "binary_acc_transfer": multitask_binary_metrics.get("binary_acc_transfer", np.nan),
+                "transform_test_accuracy": multitask_transform_metrics.get("transform_test_accuracy", np.nan),
+                "transform_test_macro_f1": multitask_transform_metrics.get("transform_test_macro_f1", np.nan),
+                "checkpoint_path": str(multitask_train.checkpoint_path),
+            }
+        )
 
     comparison_df = build_comparison_table(
         binary_train,
         binary_metrics,
         transform_train,
         transform_metrics,
-        multitask_train,
-        multitask_binary_metrics,
-        multitask_transform_metrics,
+        multitask_rows,
     )
     comparison_path = RESULTS_DIR / "final_model_comparison.csv"
     comparison_df.to_csv(comparison_path, index=False)
