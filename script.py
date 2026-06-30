@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from PIL import Image, ImageFile
+from PIL import Image, ImageFile, ImageFilter
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
@@ -108,6 +108,12 @@ FREEZE_BACKBONE = True
 # Number of final Swin encoder stages to train when FREEZE_BACKBONE is True.
 # 0 keeps the previous behavior: the full backbone stays frozen.
 SWIN_TRAINABLE_STAGES = 1
+
+USE_RESIDUAL_STATS = True
+RESIDUAL_BLUR_RADIUS = 1.0
+RESIDUAL_STATS_IMAGE_SIZE = 224
+RESIDUAL_HIST_BINS = 8
+RESIDUAL_STATS_DIM = 3 * 4 + 2 + 1 + RESIDUAL_HIST_BINS
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -210,6 +216,112 @@ def make_cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
 def validate_batch_size(total: int) -> None:
     if total <= 0:
         raise ValueError("Empty dataset split encountered.")
+
+
+def active_residual_stats_dim() -> int:
+    return RESIDUAL_STATS_DIM if USE_RESIDUAL_STATS else 0
+
+
+def make_run_name(base_name: str) -> str:
+    return f"resstats_{base_name}" if USE_RESIDUAL_STATS else base_name
+
+
+def unpack_batch(
+    batch: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    if len(batch) == 4:
+        pixel_values, residual_stats, binary_labels, transform_labels = batch
+        return pixel_values, residual_stats, binary_labels, transform_labels
+    if len(batch) == 3:
+        pixel_values, binary_labels, transform_labels = batch
+        return pixel_values, None, binary_labels, transform_labels
+    raise ValueError(f"Expected a batch with 3 or 4 elements, got {len(batch)}.")
+
+
+def compute_residual_stats(image: Image.Image) -> torch.Tensor:
+    stats_image = image.convert("RGB").resize(
+        (RESIDUAL_STATS_IMAGE_SIZE, RESIDUAL_STATS_IMAGE_SIZE),
+        Image.Resampling.BILINEAR,
+    )
+    blurred = stats_image.filter(ImageFilter.GaussianBlur(radius=RESIDUAL_BLUR_RADIUS))
+
+    image_array = np.asarray(stats_image, dtype=np.float32) / 255.0
+    blurred_array = np.asarray(blurred, dtype=np.float32) / 255.0
+    image_tensor = torch.from_numpy(image_array)
+    blurred_tensor = torch.from_numpy(blurred_array)
+    residual = (image_tensor - blurred_tensor).abs()
+
+    flat_residual = residual.reshape(-1, 3)
+    channel_mean = flat_residual.mean(dim=0)
+    channel_std = flat_residual.std(dim=0, unbiased=False)
+    channel_max = flat_residual.max(dim=0).values
+    channel_p95 = torch.quantile(flat_residual, 0.95, dim=0)
+
+    residual_values = residual.reshape(-1)
+    global_mean = residual_values.mean().view(1)
+    global_std = residual_values.std(unbiased=False).view(1)
+    hist = torch.histc(residual_values, bins=RESIDUAL_HIST_BINS, min=0.0, max=1.0)
+    hist = hist / hist.sum().clamp_min(1.0)
+
+    gray = image_tensor.mean(dim=2)
+    if gray.shape[0] > 2 and gray.shape[1] > 2:
+        laplacian = (
+            -4.0 * gray[1:-1, 1:-1]
+            + gray[:-2, 1:-1]
+            + gray[2:, 1:-1]
+            + gray[1:-1, :-2]
+            + gray[1:-1, 2:]
+        )
+        laplacian_var = laplacian.var(unbiased=False).view(1)
+    else:
+        laplacian_var = torch.zeros(1, dtype=torch.float32)
+
+    stats = torch.cat(
+        [
+            channel_mean,
+            channel_std,
+            channel_max,
+            channel_p95,
+            global_mean,
+            global_std,
+            laplacian_var,
+            hist,
+        ]
+    ).to(dtype=torch.float32)
+
+    if stats.numel() != RESIDUAL_STATS_DIM:
+        raise RuntimeError(
+            f"Residual stats dimension mismatch: expected {RESIDUAL_STATS_DIM}, got {stats.numel()}."
+        )
+    if not torch.isfinite(stats).all():
+        raise RuntimeError("Residual stats contain NaN or Inf values.")
+    return stats
+
+
+def combine_with_residual_stats(
+    features: torch.Tensor,
+    residual_stats: torch.Tensor | None,
+    use_residual_stats: bool,
+    residual_stats_dim: int,
+) -> torch.Tensor:
+    if not use_residual_stats:
+        return features
+    if residual_stats is None:
+        raise ValueError("USE_RESIDUAL_STATS=True, but residual_stats were not provided to the model.")
+    if residual_stats.ndim == 1:
+        residual_stats = residual_stats.unsqueeze(0)
+    if residual_stats.shape[0] != features.shape[0]:
+        raise ValueError(
+            f"Residual stats batch size {residual_stats.shape[0]} does not match "
+            f"feature batch size {features.shape[0]}."
+        )
+    if residual_stats.shape[1] != residual_stats_dim:
+        raise ValueError(
+            f"Expected residual stats dim {residual_stats_dim}, got {residual_stats.shape[1]}."
+        )
+
+    residual_stats = residual_stats.to(device=features.device, dtype=features.dtype)
+    return torch.cat([features, residual_stats], dim=1)
 
 
 # == DATA ==
@@ -376,6 +488,9 @@ class AIRealTransformDataset(Dataset):
         pixel_values = encoded["pixel_values"][0]
         binary_label = int(row["binary_label"])
         transform_label = int(row["transform_label"])
+        if USE_RESIDUAL_STATS:
+            residual_stats = compute_residual_stats(image)
+            return pixel_values, residual_stats, binary_label, transform_label
         return pixel_values, binary_label, transform_label
 
 
@@ -412,12 +527,20 @@ def make_loaders(train_df, val_df, test_df, image_processor, batch_size: int):
         persistent_workers=persistent_workers,
     )
 
-    sample_pixels, sample_binary, sample_transform = train_dataset[0]
-    print(
-        f"Sample tensor shape: {tuple(sample_pixels.shape)}, "
-        f"binary={sample_binary} ({IDX_TO_CLASS[sample_binary]}), "
-        f"transform={sample_transform} ({IDX_TO_TRANSFORM[sample_transform]})"
+    sample = train_dataset[0]
+    sample_pixels, sample_residual_stats, sample_binary, sample_transform = unpack_batch(sample)
+    sample_parts = [f"Sample tensor shape: {tuple(sample_pixels.shape)}"]
+    if USE_RESIDUAL_STATS:
+        if sample_residual_stats is None:
+            raise RuntimeError("USE_RESIDUAL_STATS=True but the dataset did not return residual stats.")
+        sample_parts.append(f"residual_stats_shape={tuple(sample_residual_stats.shape)}")
+    sample_parts.extend(
+        [
+            f"binary={sample_binary} ({IDX_TO_CLASS[sample_binary]})",
+            f"transform={sample_transform} ({IDX_TO_TRANSFORM[sample_transform]})",
+        ]
     )
+    print(", ".join(sample_parts))
     return train_loader, val_loader, test_loader
 
 
@@ -427,10 +550,14 @@ class TransformerFeatureExtractor(nn.Module):
     def __init__(
         self,
         cfg: dict,
-        freeze_backbone: bool = FREEZE_BACKBONE,
-        swin_trainable_stages: int = SWIN_TRAINABLE_STAGES,
+        freeze_backbone: bool | None = None,
+        swin_trainable_stages: int | None = None,
     ):
         super().__init__()
+        if freeze_backbone is None:
+            freeze_backbone = FREEZE_BACKBONE
+        if swin_trainable_stages is None:
+            swin_trainable_stages = SWIN_TRAINABLE_STAGES
         self.cfg = cfg
         self.backbone_type = cfg["type"]
         self.freeze_backbone = freeze_backbone
@@ -560,40 +687,65 @@ class SingleTaskTransformerClassifier(nn.Module):
         super().__init__()
         self.task = task
         self.feature_extractor = TransformerFeatureExtractor(cfg)
+        self.use_residual_stats = USE_RESIDUAL_STATS
+        self.residual_stats_dim = active_residual_stats_dim()
+        head_input_dim = self.feature_extractor.feature_dim + self.residual_stats_dim
         self.head = nn.Sequential(
-            nn.Linear(self.feature_extractor.feature_dim, 256),
+            nn.Linear(head_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        residual_stats: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         features = self.feature_extractor(pixel_values)
-        return self.head(features)
+        combined_features = combine_with_residual_stats(
+            features,
+            residual_stats,
+            self.use_residual_stats,
+            self.residual_stats_dim,
+        )
+        return self.head(combined_features)
 
 
 class MultiTaskTransformerClassifier(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         self.feature_extractor = TransformerFeatureExtractor(cfg)
-        feature_dim = self.feature_extractor.feature_dim
+        self.use_residual_stats = USE_RESIDUAL_STATS
+        self.residual_stats_dim = active_residual_stats_dim()
+        head_input_dim = self.feature_extractor.feature_dim + self.residual_stats_dim
         self.binary_head = nn.Sequential(
-            nn.Linear(feature_dim, 256),
+            nn.Linear(head_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, len(CLASS_NAMES)),
         )
         self.transform_head = nn.Sequential(
-            nn.Linear(feature_dim, 256),
+            nn.Linear(head_input_dim, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(256, len(TRANSFORM_NAMES)),
         )
 
-    def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        residual_stats: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.feature_extractor(pixel_values)
-        binary_logits = self.binary_head(features)
-        transform_logits = self.transform_head(features)
+        combined_features = combine_with_residual_stats(
+            features,
+            residual_stats,
+            self.use_residual_stats,
+            self.residual_stats_dim,
+        )
+        binary_logits = self.binary_head(combined_features)
+        transform_logits = self.transform_head(combined_features)
         return binary_logits, transform_logits
 
 
@@ -622,12 +774,15 @@ def run_single_task_epoch(
     total = 0
 
     with torch.set_grad_enabled(is_training):
-        for pixel_values, binary_labels, transform_labels in tqdm(loader, leave=False):
+        for batch in tqdm(loader, leave=False):
+            pixel_values, residual_stats, binary_labels, transform_labels = unpack_batch(batch)
             pixel_values = pixel_values.to(DEVICE)
             labels = select_task_labels(binary_labels, transform_labels, task).to(DEVICE)
 
-            logits = model(pixel_values)
+            logits = model(pixel_values, residual_stats)
             loss = criterion(logits, labels)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite {task} loss encountered: {loss.item()}.")
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -658,15 +813,18 @@ def run_multitask_epoch(
     total = 0
 
     with torch.set_grad_enabled(is_training):
-        for pixel_values, binary_labels, transform_labels in tqdm(loader, leave=False):
+        for batch in tqdm(loader, leave=False):
+            pixel_values, residual_stats, binary_labels, transform_labels = unpack_batch(batch)
             pixel_values = pixel_values.to(DEVICE)
             binary_labels = binary_labels.to(DEVICE)
             transform_labels = transform_labels.to(DEVICE)
 
-            binary_logits, transform_logits = model(pixel_values)
+            binary_logits, transform_logits = model(pixel_values, residual_stats)
             loss_binary = criterion_binary(binary_logits, binary_labels)
             loss_transform = criterion_transform(transform_logits, transform_labels)
             loss_total = lambda_value * loss_binary + (1.0 - lambda_value) * loss_transform
+            if not torch.isfinite(loss_total):
+                raise RuntimeError(f"Non-finite multitask loss encountered: {loss_total.item()}.")
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -687,10 +845,14 @@ def run_multitask_epoch(
 def verify_single_task_forward(model: nn.Module, loader: DataLoader, task: str, num_classes: int) -> None:
     model.eval()
     with torch.no_grad():
-        pixel_values, binary_labels, transform_labels = next(iter(loader))
-        logits = model(pixel_values.to(DEVICE))
+        pixel_values, residual_stats, binary_labels, transform_labels = unpack_batch(next(iter(loader)))
+        logits = model(pixel_values.to(DEVICE), residual_stats)
         labels = select_task_labels(binary_labels, transform_labels, task)
-        print(f"{task} forward check: logits={tuple(logits.shape)}, labels={tuple(labels.shape)}")
+        residual_shape = None if residual_stats is None else tuple(residual_stats.shape)
+        print(
+            f"{task} forward check: logits={tuple(logits.shape)}, "
+            f"labels={tuple(labels.shape)}, residual_stats={residual_shape}"
+        )
         if logits.shape[-1] != num_classes:
             raise RuntimeError(f"Expected {num_classes} logits for {task}, got {logits.shape[-1]}.")
 
@@ -698,12 +860,13 @@ def verify_single_task_forward(model: nn.Module, loader: DataLoader, task: str, 
 def verify_multitask_forward(model: nn.Module, loader: DataLoader) -> None:
     model.eval()
     with torch.no_grad():
-        pixel_values, _, _ = next(iter(loader))
-        binary_logits, transform_logits = model(pixel_values.to(DEVICE))
+        pixel_values, residual_stats, _, _ = unpack_batch(next(iter(loader)))
+        binary_logits, transform_logits = model(pixel_values.to(DEVICE), residual_stats)
         print(
             "multitask forward check: "
             f"binary_logits={tuple(binary_logits.shape)}, "
-            f"transform_logits={tuple(transform_logits.shape)}"
+            f"transform_logits={tuple(transform_logits.shape)}, "
+            f"residual_stats={None if residual_stats is None else tuple(residual_stats.shape)}"
         )
         if binary_logits.shape[-1] != len(CLASS_NAMES):
             raise RuntimeError("Invalid binary head output size.")
@@ -720,10 +883,11 @@ def train_single_task_model(
     settings: RunSettings,
 ) -> tuple[TrainResult, nn.Module]:
     num_classes = len(CLASS_NAMES) if task == "binary" else len(TRANSFORM_NAMES)
-    checkpoint_path = CHECKPOINT_DIR / f"{SELECTED_BACKBONE}_{model_name}.pt"
+    effective_model_name = make_run_name(model_name)
+    checkpoint_path = CHECKPOINT_DIR / f"{SELECTED_BACKBONE}_{effective_model_name}.pt"
 
     print("\n" + "=" * 72)
-    print(f"Training {model_name} | task={task} | backbone={SELECTED_BACKBONE}")
+    print(f"Training {effective_model_name} | task={task} | backbone={SELECTED_BACKBONE}")
     print("=" * 72)
 
     model = SingleTaskTransformerClassifier(cfg, num_classes=num_classes, task=task).to(DEVICE)
@@ -732,7 +896,9 @@ def train_single_task_model(
     print(
         f"Trainable parameters: {trainable_params:,} "
         f"(freeze_backbone={FREEZE_BACKBONE}, "
-        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES})"
+        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES}, "
+        f"use_residual_stats={USE_RESIDUAL_STATS}, "
+        f"residual_stats_dim={active_residual_stats_dim()})"
     )
     verify_single_task_forward(model, train_loader, task, num_classes)
 
@@ -775,7 +941,7 @@ def train_single_task_model(
         model.load_state_dict(best_state_dict)
 
     train_result = TrainResult(
-        model_name=model_name,
+        model_name=effective_model_name,
         task_type=task,
         best_val_score=float(best_val_acc),
         checkpoint_path=checkpoint_path,
@@ -791,7 +957,7 @@ def train_multitask_model(
     settings: RunSettings,
     lambda_value: float,
 ) -> tuple[TrainResult, nn.Module]:
-    model_name = f"multitask_lambda_{lambda_value:.2f}"
+    model_name = make_run_name(f"multitask_lambda_{lambda_value:.2f}")
     checkpoint_path = CHECKPOINT_DIR / f"{SELECTED_BACKBONE}_{model_name}.pt"
 
     print("\n" + "=" * 72)
@@ -804,7 +970,9 @@ def train_multitask_model(
     print(
         f"Trainable parameters: {trainable_params:,} "
         f"(freeze_backbone={FREEZE_BACKBONE}, "
-        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES})"
+        f"swin_trainable_stages={SWIN_TRAINABLE_STAGES}, "
+        f"use_residual_stats={USE_RESIDUAL_STATS}, "
+        f"residual_stats_dim={active_residual_stats_dim()})"
     )
     verify_multitask_forward(model, train_loader)
 
@@ -881,9 +1049,10 @@ def collect_single_task_predictions(model: nn.Module, loader: DataLoader, task: 
     y_prob = []
 
     with torch.no_grad():
-        for pixel_values, binary_labels, transform_labels in tqdm(loader, leave=False):
+        for batch in tqdm(loader, leave=False):
+            pixel_values, residual_stats, binary_labels, transform_labels = unpack_batch(batch)
             pixel_values = pixel_values.to(DEVICE)
-            logits = model(pixel_values)
+            logits = model(pixel_values, residual_stats)
             probabilities = torch.softmax(logits, dim=1).cpu().numpy()
 
             binary_true.extend(binary_labels.numpy())
@@ -913,9 +1082,10 @@ def collect_multitask_predictions(model: nn.Module, loader: DataLoader) -> dict[
     transform_prob = []
 
     with torch.no_grad():
-        for pixel_values, binary_labels, transform_labels in tqdm(loader, leave=False):
+        for batch in tqdm(loader, leave=False):
+            pixel_values, residual_stats, binary_labels, transform_labels = unpack_batch(batch)
             pixel_values = pixel_values.to(DEVICE)
-            binary_logits, transform_logits = model(pixel_values)
+            binary_logits, transform_logits = model(pixel_values, residual_stats)
 
             binary_true.extend(binary_labels.numpy())
             transform_true.extend(transform_labels.numpy())
@@ -1131,11 +1301,13 @@ def build_comparison_table(
 ) -> pd.DataFrame:
     rows = [
         {
-            "model_name": "binary_baseline",
+            "model_name": binary_train.model_name,
             "selected_backbone": SELECTED_BACKBONE,
             "task_type": "binary",
             "freeze_backbone": FREEZE_BACKBONE,
             "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
+            "use_residual_stats": USE_RESIDUAL_STATS,
+            "residual_stats_dim": active_residual_stats_dim(),
             "lambda": np.nan,
             "binary_loss_weight": 1.0,
             "transform_loss_weight": np.nan,
@@ -1152,11 +1324,13 @@ def build_comparison_table(
             "checkpoint_path": str(binary_train.checkpoint_path),
         },
         {
-            "model_name": "transform_baseline",
+            "model_name": transform_train.model_name,
             "selected_backbone": SELECTED_BACKBONE,
             "task_type": "transform",
             "freeze_backbone": FREEZE_BACKBONE,
             "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
+            "use_residual_stats": USE_RESIDUAL_STATS,
+            "residual_stats_dim": active_residual_stats_dim(),
             "lambda": np.nan,
             "binary_loss_weight": np.nan,
             "transform_loss_weight": 1.0,
@@ -1203,6 +1377,8 @@ def main() -> None:
         f"num_workers={NUM_WORKERS}, "
         f"freeze_backbone={FREEZE_BACKBONE}, "
         f"swin_trainable_stages={SWIN_TRAINABLE_STAGES}, "
+        f"use_residual_stats={USE_RESIDUAL_STATS}, "
+        f"residual_stats_dim={active_residual_stats_dim()}, "
         f"lambda_values={', '.join(f'{value:.2f}' for value in lambda_values)}"
     )
 
@@ -1240,7 +1416,7 @@ def main() -> None:
         val_loader=val_loader,
         settings=settings,
     )
-    binary_metrics = evaluate_single_task_model(binary_model, test_loader, "binary", "binary_baseline")
+    binary_metrics = evaluate_single_task_model(binary_model, test_loader, "binary", binary_train.model_name)
     del binary_model
     clear_memory()
 
@@ -1252,7 +1428,12 @@ def main() -> None:
         val_loader=val_loader,
         settings=settings,
     )
-    transform_metrics = evaluate_single_task_model(transform_model, test_loader, "transform", "transform_baseline")
+    transform_metrics = evaluate_single_task_model(
+        transform_model,
+        test_loader,
+        "transform",
+        transform_train.model_name,
+    )
     del transform_model
     clear_memory()
 
@@ -1265,20 +1446,22 @@ def main() -> None:
             settings=settings,
             lambda_value=lambda_value,
         )
-        run_name = f"multitask_lambda_{lambda_value:.2f}"
         multitask_binary_metrics, multitask_transform_metrics = evaluate_multitask_model(
             multitask_model,
             test_loader,
-            run_name,
+            multitask_train.model_name,
         )
         del multitask_model
         clear_memory()
         multitask_rows.append(
             {
-                "model_name": f"multitask_lambda_{lambda_value:.2f}",
+                "model_name": multitask_train.model_name,
                 "selected_backbone": SELECTED_BACKBONE,
                 "task_type": "multitask",
                 "freeze_backbone": FREEZE_BACKBONE,
+                "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
+                "use_residual_stats": USE_RESIDUAL_STATS,
+                "residual_stats_dim": active_residual_stats_dim(),
                 "lambda": lambda_value,
                 "binary_loss_weight": lambda_value,
                 "transform_loss_weight": 1.0 - lambda_value,
