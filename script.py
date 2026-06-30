@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageFile, ImageFilter
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
@@ -103,6 +104,8 @@ MIN_DELTA = 1e-4
 # The script evaluates a small sweep of lambda values to compare task weighting.
 LAMBDA_VALUES = [0.2, 0.35, 0.65, 0.8]
 LAMBDA = 0.5
+USE_MULTITASK_TRANSFORM_FOCAL_LOSS = True
+MULTITASK_TRANSFORM_FOCAL_GAMMA = 2.0
 
 FREEZE_BACKBONE = True
 # Number of final Swin encoder stages to train when FREEZE_BACKBONE is True.
@@ -114,6 +117,10 @@ RESIDUAL_BLUR_RADIUS = 1.0
 RESIDUAL_STATS_IMAGE_SIZE = 224
 RESIDUAL_HIST_BINS = 8
 RESIDUAL_STATS_DIM = 3 * 4 + 2 + 1 + RESIDUAL_HIST_BINS
+RESIDUAL_STATS_CSV_PATH = (
+    Path("data")
+    / f"residual_stats_size{RESIDUAL_STATS_IMAGE_SIZE}_blur{RESIDUAL_BLUR_RADIUS}_bins{RESIDUAL_HIST_BINS}.csv"
+)
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -298,6 +305,100 @@ def compute_residual_stats(image: Image.Image) -> torch.Tensor:
     return stats
 
 
+def residual_stats_feature_columns() -> list[str]:
+    return [f"res_stat_{idx:02d}" for idx in range(RESIDUAL_STATS_DIM)]
+
+
+def _residual_stats_dataframe_to_cache(
+    cached_df: pd.DataFrame,
+    feature_columns: list[str],
+) -> dict[str, torch.Tensor]:
+    values = cached_df[feature_columns].to_numpy(dtype=np.float32)
+    return {
+        str(path): torch.tensor(row, dtype=torch.float32)
+        for path, row in zip(cached_df["path"].astype(str), values)
+    }
+
+
+def _validate_residual_stats_csv(
+    cached_df: pd.DataFrame,
+    required_paths: set[str],
+    feature_columns: list[str],
+) -> str | None:
+    required_columns = ["path", *feature_columns]
+    missing_columns = [column for column in required_columns if column not in cached_df.columns]
+    if missing_columns:
+        return f"missing columns: {missing_columns}"
+
+    actual_feature_columns = [column for column in cached_df.columns if column.startswith("res_stat_")]
+    if len(actual_feature_columns) != RESIDUAL_STATS_DIM:
+        return (
+            f"expected {RESIDUAL_STATS_DIM} residual-stat columns, "
+            f"found {len(actual_feature_columns)}"
+        )
+
+    cached_paths = set(cached_df["path"].astype(str))
+    missing_paths = required_paths - cached_paths
+    if missing_paths:
+        return f"missing {len(missing_paths)} required image paths"
+
+    feature_values = cached_df[feature_columns].to_numpy(dtype=np.float32)
+    if not np.isfinite(feature_values).all():
+        return "non-finite residual-stat values"
+
+    return None
+
+
+def build_or_load_residual_stats_csv(
+    df: pd.DataFrame,
+    csv_path: Path,
+) -> dict[str, torch.Tensor]:
+    feature_columns = residual_stats_feature_columns()
+    required_paths = sorted(set(df["path"].astype(str)))
+
+    print("\n== Residual Statistics Cache ==")
+    print(f"CSV path: {csv_path}")
+    print(f"Required images: {len(required_paths)}")
+    print(f"Residual stats dimension: {RESIDUAL_STATS_DIM}")
+
+    if csv_path.exists():
+        try:
+            cached_df = pd.read_csv(csv_path)
+            invalid_reason = _validate_residual_stats_csv(
+                cached_df,
+                set(required_paths),
+                feature_columns,
+            )
+            if invalid_reason is None:
+                valid_df = cached_df[cached_df["path"].astype(str).isin(required_paths)].copy()
+                print(
+                    "Loaded residual statistics CSV; recomputation skipped. "
+                    f"Cached images available for this run: {len(valid_df)}"
+                )
+                return _residual_stats_dataframe_to_cache(valid_df, feature_columns)
+            print(f"[warning] Residual statistics CSV is invalid: {invalid_reason}. Recomputing.")
+        except Exception as error:
+            print(f"[warning] Could not load residual statistics CSV: {error}. Recomputing.")
+    else:
+        print("Residual statistics CSV not found. Computing residual statistics once.")
+
+    rows = []
+    for image_path in tqdm(required_paths, desc="Computing residual stats", leave=False):
+        with Image.open(image_path) as image_file:
+            image = image_file.convert("RGB")
+        stats = compute_residual_stats(image)
+        row = {"path": image_path}
+        row.update({column: float(value) for column, value in zip(feature_columns, stats.tolist())})
+        rows.append(row)
+
+    residual_df = pd.DataFrame(rows, columns=["path", *feature_columns])
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    residual_df.to_csv(csv_path, index=False)
+    print(f"Created residual statistics CSV with {len(residual_df)} images: {csv_path}")
+
+    return _residual_stats_dataframe_to_cache(residual_df, feature_columns)
+
+
 def combine_with_residual_stats(
     features: torch.Tensor,
     residual_stats: torch.Tensor | None,
@@ -474,9 +575,15 @@ def split_dataframe(df: pd.DataFrame, seed: int = SEED) -> tuple[pd.DataFrame, p
 
 
 class AIRealTransformDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, image_processor):
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        image_processor,
+        residual_stats_cache: dict[str, torch.Tensor] | None = None,
+    ):
         self.df = dataframe.reset_index(drop=True)
         self.image_processor = image_processor
+        self.residual_stats_cache = residual_stats_cache
 
     def __len__(self) -> int:
         return len(self.df)
@@ -489,15 +596,28 @@ class AIRealTransformDataset(Dataset):
         binary_label = int(row["binary_label"])
         transform_label = int(row["transform_label"])
         if USE_RESIDUAL_STATS:
-            residual_stats = compute_residual_stats(image)
+            image_path = str(row["path"])
+            if self.residual_stats_cache is not None:
+                if image_path not in self.residual_stats_cache:
+                    raise KeyError(f"Missing residual statistics for image path: {image_path}")
+                residual_stats = self.residual_stats_cache[image_path].to(dtype=torch.float32)
+            else:
+                residual_stats = compute_residual_stats(image)
             return pixel_values, residual_stats, binary_label, transform_label
         return pixel_values, binary_label, transform_label
 
 
-def make_loaders(train_df, val_df, test_df, image_processor, batch_size: int):
-    train_dataset = AIRealTransformDataset(train_df, image_processor)
-    val_dataset = AIRealTransformDataset(val_df, image_processor)
-    test_dataset = AIRealTransformDataset(test_df, image_processor)
+def make_loaders(
+    train_df,
+    val_df,
+    test_df,
+    image_processor,
+    batch_size: int,
+    residual_stats_cache: dict[str, torch.Tensor] | None = None,
+):
+    train_dataset = AIRealTransformDataset(train_df, image_processor, residual_stats_cache)
+    val_dataset = AIRealTransformDataset(val_df, image_processor, residual_stats_cache)
+    test_dataset = AIRealTransformDataset(test_df, image_processor, residual_stats_cache)
 
     pin_memory = DEVICE.type == "cuda"
     persistent_workers = NUM_WORKERS > 0
@@ -751,6 +871,38 @@ class MultiTaskTransformerClassifier(nn.Module):
 
 # == TRAIN ==
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1.0 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        if self.reduction == "sum":
+            return focal_loss.sum()
+        if self.reduction == "none":
+            return focal_loss
+        raise ValueError(f"Unsupported reduction mode: {self.reduction}")
+
+
+def build_multitask_transform_criterion() -> nn.Module:
+    if USE_MULTITASK_TRANSFORM_FOCAL_LOSS:
+        print(
+            "Using FocalLoss for the multitask transform head "
+            f"(gamma={MULTITASK_TRANSFORM_FOCAL_GAMMA})."
+        )
+        return FocalLoss(gamma=MULTITASK_TRANSFORM_FOCAL_GAMMA)
+
+    print("Using CrossEntropyLoss for the multitask transform head.")
+    return nn.CrossEntropyLoss()
+
+
 def select_task_labels(binary_labels: torch.Tensor, transform_labels: torch.Tensor, task: str) -> torch.Tensor:
     if task == "binary":
         return binary_labels
@@ -977,7 +1129,7 @@ def train_multitask_model(
     verify_multitask_forward(model, train_loader)
 
     criterion_binary = nn.CrossEntropyLoss()
-    criterion_transform = nn.CrossEntropyLoss()
+    criterion_transform = build_multitask_transform_criterion()
     optimizer = torch.optim.AdamW(
         filter(lambda parameter: parameter.requires_grad, model.parameters()),
         lr=LEARNING_RATE,
@@ -1308,6 +1460,8 @@ def build_comparison_table(
             "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
             "use_residual_stats": USE_RESIDUAL_STATS,
             "residual_stats_dim": active_residual_stats_dim(),
+            "multitask_transform_loss": np.nan,
+            "multitask_transform_focal_gamma": np.nan,
             "lambda": np.nan,
             "binary_loss_weight": 1.0,
             "transform_loss_weight": np.nan,
@@ -1331,6 +1485,8 @@ def build_comparison_table(
             "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
             "use_residual_stats": USE_RESIDUAL_STATS,
             "residual_stats_dim": active_residual_stats_dim(),
+            "multitask_transform_loss": np.nan,
+            "multitask_transform_focal_gamma": np.nan,
             "lambda": np.nan,
             "binary_loss_weight": np.nan,
             "transform_loss_weight": 1.0,
@@ -1379,6 +1535,8 @@ def main() -> None:
         f"swin_trainable_stages={SWIN_TRAINABLE_STAGES}, "
         f"use_residual_stats={USE_RESIDUAL_STATS}, "
         f"residual_stats_dim={active_residual_stats_dim()}, "
+        f"multitask_transform_focal_loss={USE_MULTITASK_TRANSFORM_FOCAL_LOSS}, "
+        f"multitask_transform_focal_gamma={MULTITASK_TRANSFORM_FOCAL_GAMMA}, "
         f"lambda_values={', '.join(f'{value:.2f}' for value in lambda_values)}"
     )
 
@@ -1397,6 +1555,15 @@ def main() -> None:
     val_df.to_csv(RESULTS_DIR / "split_val.csv", index=False)
     test_df.to_csv(RESULTS_DIR / "split_test.csv", index=False)
 
+    if USE_RESIDUAL_STATS:
+        cache_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+        residual_stats_cache = build_or_load_residual_stats_csv(
+            cache_df,
+            RESIDUAL_STATS_CSV_PATH,
+        )
+    else:
+        residual_stats_cache = None
+
     image_processor = get_image_processor(cfg)
     print(f"\nImage processor loaded for {SELECTED_BACKBONE}: {image_processor.__class__.__name__}")
 
@@ -1406,6 +1573,7 @@ def main() -> None:
         test_df,
         image_processor,
         settings.batch_size,
+        residual_stats_cache,
     )
 
     binary_train, binary_model = train_single_task_model(
@@ -1462,6 +1630,14 @@ def main() -> None:
                 "swin_trainable_stages": SWIN_TRAINABLE_STAGES,
                 "use_residual_stats": USE_RESIDUAL_STATS,
                 "residual_stats_dim": active_residual_stats_dim(),
+                "multitask_transform_loss": (
+                    "focal" if USE_MULTITASK_TRANSFORM_FOCAL_LOSS else "cross_entropy"
+                ),
+                "multitask_transform_focal_gamma": (
+                    MULTITASK_TRANSFORM_FOCAL_GAMMA
+                    if USE_MULTITASK_TRANSFORM_FOCAL_LOSS
+                    else np.nan
+                ),
                 "lambda": lambda_value,
                 "binary_loss_weight": lambda_value,
                 "transform_loss_weight": 1.0 - lambda_value,
